@@ -51,7 +51,13 @@ To clone the repo:
 ### Usage
 Code takes UKHF data from UDAL and creates GPAD dashboard.
 
-Currently data is hard coded to caluclate rates for South West Region and ICBs.  This could be adjusted to work within other gegions.
+Currently data is hard coded to caluclate rates for South West Region and ICBs.  This could be adjusted to work within other regions.
+
+To run the report you need access to UDAL and create a personal credentials file with server name and user details.
+
+This file will be sourced from the gp.data_input_sql.R file which will create a CSV.
+
+This CSV is then read in by the GP Flex v3d file which needs to be knitted from within posit.
 
 #### Outputs
 Results in markdown flex dashboard
