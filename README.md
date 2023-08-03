@@ -1,27 +1,44 @@
-# {PROJECT NAME}
-## NHS England Digitial Analytics and Research Team - PhD Internship Project
+# GP GPAD Access Dashboard
+## NHS England SW Intelligence and Insights
 
 ### About the Project
 
 [![status: experimental](https://github.com/GIScience/badges/raw/master/status/experimental.svg)](https://github.com/GIScience/badges#experimental)
 
-This repository holds code for the {PROJECT NAME} {SHORT DESCRIPTION}
-
-[Link to original project propsoal](https://nhsx.github.io/nhsx-internship-projects/)
+This repository holds code for the GP Access Dashboard
 
 _**Note:** Only public or fake data are shared in this repository._
 
 ### Project Stucture
 
 - The main code is found in the root of the repository (see Usage below for more information)
-- The accompanying [report](./reports/report.pdf) is also available in the `reports` folder
-- More information about the code usage can be found in the [model card](./model_card.md)
-- {OTHER REPO STRUCTURE}
 
 ### Built With
 
-[![Python v3.8](https://img.shields.io/badge/python-v3.8-blue.svg)](https://www.python.org/downloads/release/python-380/)
-- {LIST OF MAIN PACKAGE VERSIONS}
+[R Studio](RStudio Team (2020). RStudio: Integrated Development for R. RStudio, PBC, Boston, MA URL http://www.rstudio.com/.)  
+[R Statistical Software](  R Core Team (2018). R: A language and environment for statistical computing. R Foundation for Statistical Computing, Vienna, Austria. URL https://www.R-project.org/.)
+
+library(flexdashboard)
+library(tidyverse)
+library(readr)
+library(easycsv)
+library(janitor)
+library(lubridate)
+library(timeDate)
+library(bizdays)
+library(readxl)
+library(rjson)
+library(TTR)
+library(astsa)
+library(forecast)
+library(rlang)
+library(gridExtra)
+library(reactable)
+library(english)
+library(gridExtra)
+library(here)
+library(zoo)
+library(NHSRplotthedots)
 
 ### Getting Started
 
@@ -31,31 +48,20 @@ To get a local copy up and running follow these simple steps.
 
 To clone the repo:
 
-`git clone https://github.com/nhsx/{REPO NAME}`
-
-To create a suitable environment:
-- ```python -m venv _env```
-- `source _env/bin/activate`
-- `pip install -r requirements.txt`
-
-{ADDITIONAL TECHNICAL SUPPORT AND NEEDS} 
-
 ### Usage
-{DESCRIPTION OF CODE}
+Code takes UKHF data from UDAL and creates GPAD dashboard.
+
+Currently data is hard coded to caluclate rates for South West Region and ICBs.  This could be adjusted to work within other gegions.
 
 #### Outputs
-{LIST AND DESCRIPTION OF OUTPUTS}
-
-{NOTES ON REPRODUCIBILITY OF RESULTS}
+Results in markdown flex dashboard
 
 #### Datasets
-{DESCRIPTION AND LINKS TO DATASETS}
+Uses publically available GPAD data.  This is pulled from UDAL within NHSE.
 
-{LINK TO FAKE DATA TO SUPPORT INITAIL CODE RUNS}
 
 ### Roadmap
-
-See the {LINK TO REPO ISSUES} for a list of proposed features (and known issues).
+Hope to add more analysis around timeliness metrics as these are developed nationally.
 
 ### Contributing
 
@@ -84,8 +90,7 @@ of the [Open Government 3.0][ogl] licence.
 [ogl]: http://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/
 
 ### Contact
+Simon Wellesley-Miller
 
-To find out more about the [Digitial Analytics and Research Team](https://www.nhsx.nhs.uk/key-tools-and-info/nhsx-analytics-unit/) visit our [project website](https://nhsx.github.io/AnalyticsUnit/projects.html) or get in touch at [analytics-unit@nhsx.nhs.uk](mailto:analytics-unit@nhsx.nhs.uk).
-
-<!-- ### Acknowledgements -->
+To find out more  get in touch at [Simon.Wellesley-Miller](mailto:simon.wellesley-miller@nhs.net).
 
