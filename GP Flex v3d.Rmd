@@ -1,0 +1,3024 @@
+---
+title: "GP Appointments - South West Focus"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+
+# read in libraries
+library(flexdashboard)
+library(tidyverse)
+library(readr)
+library(easycsv)
+library(janitor)
+library(lubridate)
+library(timeDate)
+library(bizdays)
+library(readxl)
+library(rjson)
+library(TTR)
+library(astsa)
+library(forecast)
+library(rlang)
+library(gridExtra)
+library(reactable)
+library(english)
+library(gridExtra)
+library(here)
+library(zoo)
+library(NHSRplotthedots)
+
+#source('gp_data_input_sql.R')
+
+## read in the data - manual csv version
+gp_dat <- read.csv("gp_dat2.csv")
+
+#gp_dat <- df2
+
+gp_dat <- clean_names(gp_dat)
+
+# coerce date variable to date format
+gp_dat$appointment_date <- as.Date(fasttime::fastPOSIXct(gp_dat$appointment_date))
+
+gp_dat <- gp_dat %>%
+  filter (appointment_date >= '2018-01-01')
+
+# load in function for calendar heatmap
+source(here("date_heatmap.R"))
+
+
+
+
+#########################
+# working days function #
+#########################
+
+# download data from gov.uk
+data <- fromJSON(file="https://www.gov.uk/bank-holidays.json")
+
+# downloads it as 3 lists, we just want first list 
+# (second is Scotland and third is northern island)
+# convert list into a data frame and put into correct format
+bh <- as.data.frame(data[1])
+bh <- bh %>% pivot_longer(cols = starts_with("england.and.wales.events.date"),
+                          names_to = "date" ) 
+bh <- as.data.frame(bh)
+bh <- bh %>% select (value)
+
+#  create a calendar with above dates as non working days
+# specify Saturday and Sunday as non working days
+uk_cal <- create.calendar(
+  "uk_cal",
+  holidays = bh$value,
+  weekdays = c("sunday", "saturday") ,
+  start.date = NULL,
+  end.date = NULL,
+  adjust.from = adjust.none,
+  adjust.to = adjust.none,
+  financial = FALSE
+)
+
+
+#############################
+# add some helper variables #
+#############################
+
+# add a month variable 
+# (converts all appts dates to last day in month so they can be grouped)
+com_reg <- gp_dat %>%
+  mutate (rpt_mth = ceiling_date(appointment_date, "month") - days(1))
+
+# convert local stp names into readable format
+com_reg <- com_reg %>% mutate (
+  stp_name_short = case_when(
+    stp_name == 'SOUTH WEST' ~ 'South West',
+    stp_name == 'NHS DORSET INTEGRATED CARE BOARD' ~ 'Dorset',
+    stp_name == 'NHS DEVON INTEGRATED CARE BOARD' ~ 'Devon',
+    stp_name == 'NHS GLOUCESTERSHIRE INTEGRATED CARE BOARD' ~ 'Gloucestershire',
+    stp_name == 'NHS BRISTOL, NORTH SOMERSET AND SOUTH GLOUCESTERSHIRE INTEGRATED CARE BOARD' ~ 'BNSSG',
+    stp_name == 'NHS CORNWALL AND THE ISLES OF SCILLY INTEGRATED CARE BOARD' ~ 'Cornwall',
+    stp_name == 'NHS BATH AND NORTH EAST SOMERSET, SWINDON AND WILTSHIRE INTEGRATED CARE BOARD' ~ 'BSW',
+    stp_name == 'NHS SOMERSET INTEGRATED CARE BOARD' ~ 'Somerset',
+    TRUE ~ 'Non South West'
+  ))
+
+com_reg <- com_reg %>% mutate (
+  timeliness_sd = case_when (
+    time_between_book_and_appt == 'Same Day' ~ 1,
+    TRUE ~ 0),
+  timeliness_14 = case_when (
+    time_between_book_and_appt %in% c('Same Day', '1 Day', '2 to 7 Days', '8  to 14 Days') ~ 1,
+    TRUE ~ 0)
+)
+
+com_reg <- com_reg %>%
+  rename (new_region_name = region_name)
+
+latest_mth <- max(com_reg$rpt_mth)
+
+# data fix
+#com_reg <- com_reg %>%
+#  mutate (count_of_appointments = ifelse(between(rpt_mth,
+#                                                 '2020-06-30',
+#                                                 '2022-09-30'), 
+#                                         count_of_appointments/3 , 
+#                                         ifelse(rpt_mth == '2022-10-31',
+#                                                 count_of_appointments / 3 ,
+#                                                 ifelse(rpt_mth == '2022-11-30',
+#                                                 count_of_appointments / 2 ,
+#                                                 count_of_appointments ))))
+
+
+# check 
+#com_reg_chkt <- com_reg |> #filter (rpt_mth > '2020-10-01') |>
+#  group_by (rpt_mth) |>
+#  summarise (total = sum(count_of_appointments)) |>
+#  arrange (rpt_mth)
+
+########################################
+# helper functions for standardisation #
+########################################
+
+# function to create standard rate for SW
+std_rate <- function (data) {
+  data %>%
+    mutate(
+      start_mth = floor_date(rpt_mth, "month"),
+      workdays = bizdays::bizdays(start_mth, rpt_mth, uk_cal),
+      pop_fac = case_when (
+        stp_name_short == 'BSW' ~ 9.80516,
+        stp_name_short == 'BNSSG' ~ 10.57832,
+        stp_name_short == 'Cornwall' ~ 6.01786,
+        stp_name_short == 'Somerset' ~ 5.96836,
+        stp_name_short == 'Devon' ~ 12.73431,
+        stp_name_short == 'Dorset' ~ 8.19184,
+        stp_name_short == 'Gloucestershire' ~ 6.76860,
+        TRUE ~ 999999
+      ),
+      stan_appts = appts_tot / workdays,
+      rate = stan_appts / pop_fac
+    )
+}
+
+# function to create standard rate by region
+std_rate_reg <- function (data) {
+  data %>%
+    mutate(
+      start_mth = floor_date(rpt_mth, "month"),
+      workdays = bizdays::bizdays(start_mth, rpt_mth, uk_cal),
+      pop_fac = case_when (
+        new_region_name == 'SOUTH WEST' ~ 60.006444,
+        new_region_name == 'MIDLANDS' ~ 115.578126,
+        new_region_name == 'NORTH EAST AND YORKSHIRE' ~ 90.123,
+        new_region_name == 'NORTH WEST' ~ 76.71121,
+        new_region_name == 'EAST OF ENGLAND' ~ 70.82155,
+        new_region_name == 'LONDON' ~ 105.79509,
+        new_region_name == 'SOUTH EAST' ~ 95.69166,
+        new_region_name == 'National' ~ 614.98822,
+        TRUE ~ 999999
+      ),
+      stan_appts = appts_tot / workdays,
+      rate = stan_appts / pop_fac
+    )
+}
+
+
+
+########################################
+# helper functions to filter data by X #
+# at system, regional and national     #
+########################################
+
+# test dummy variables
+#area <- 'SW'
+#group1<- 'hcp_type'
+#filter1 <- 'GP'
+#group2<-'timeliness_sd'
+#filter2 <- '1'
+#group3<-''
+#filter3<-''
+
+# function to filter, group and add std rates and percentages
+# groups data at up to two levels and then filters on a final level
+# for example this gives gp appts/face2face and then timeliness
+# adds the percentage as well as a standardised rate
+
+dat <-
+  function (area,
+            group1,
+            filter1,
+            group2,
+            filter2,
+            group3,
+            filter3) {
+    # First decide how to cut base data 
+    # Either SW regions, all regions or total national
+    if (area == 'SW') {
+      df <- com_reg %>%
+        filter (new_region_name == 'SOUTH WEST')
+      grp <- 'stp_name_short'
+    }
+    if (area == 'region') {
+      df <- com_reg
+      grp <- 'new_region_name'
+      
+    }
+    if (area == 'national') {
+      df <- com_reg
+      grp <- ''
+    }
+    # set grouping variable, this will be the one before the final group
+    group <- if_else (group1 == '', '',
+                      if_else(group2 == '', group1,
+                              if_else(group3 == '',  group2, group3)))
+    
+    # filter data based on previous
+    if (group2 != '') {
+      df <- df %>%
+        filter (!!sym(group1) == filter1)
+    }
+    if (group3 != '') {
+      df <- df %>%
+        filter (!!sym(group2) == filter2)
+    }
+    
+    #  next apply required groupings
+    df <- df %>%
+      group_by(!!sym(group),
+               #!!sym(group2),
+               #!!sym(group3),
+               rpt_mth,!!sym(grp)) %>%
+      summarise(appts_tot = sum(count_of_appointments)) %>%
+      group_by (rpt_mth,!!sym(grp))  %>%
+      mutate (tot_appts = sum(appts_tot) ,
+              perc = round((appts_tot / tot_appts) * 100, 1)) %>%
+      ungroup()
+    
+    # need to rename national otherwise it jumps in as a separate facet
+    # and I want it as separate dotty line
+    if (area == 'national') {
+      df <- df %>%
+        mutate(new_region_name = 'National')
+    }
+    # add std rates
+    if (area == 'SW') {
+      df <- std_rate(df)
+    }
+    if (area %in% c('region', 'national')) {
+      df <- std_rate_reg(df)
+    }
+    return(df)
+  }
+
+test <- dat('region','','','','','','')
+
+
+library (ggforce)
+##################
+# plot functions #
+##################
+
+# dummy variables for testing
+#area <- 'SW'
+#group1<- 'hcp_type'
+#filter1 <-  'GP'
+#group2<- 'timeliness_sd'
+#filter2 <-  '1'
+#group3<-''
+#filter3 <- ''
+#rateperc <- 'rate'
+#rateperc <- 'perc'
+
+# plot function uses dat function then plots
+# can return percentage or rate
+# returns a faceted ribbon plot overlaid 
+# with national position
+ribbon_plot_fun <-
+  function (area,
+
+            group1,
+            filter1,
+            group2,
+            filter2,
+            group3,
+            filter3,
+            rateperc) {
+    grp <- ifelse (area == 'SW', 'stp_name_short',  'new_region_name')
+    #print(grp)
+    icb_totals_fac <-
+      dat  (area, group1, filter1, group2, filter2, group3, filter3)
+    
+    # decides what is the final grouping and filter
+    group <- case_when (group3 != '' ~ group3,
+                        group2 != '' ~ group2,
+                        group1 != '' ~ group1,
+                        TRUE ~ '')
+    
+    filter <- case_when (filter3 != '' ~ filter3,
+                         filter2 != '' ~ filter2,
+                         filter1 != '' ~ filter1,
+                         TRUE ~ '')
+    
+    # if there is a group filter to add, does so
+    if (group != '') {
+      icb_totals_fac <- icb_totals_fac %>%
+        filter (!!sym(group) == filter)
+    }
+    
+    labels <- icb_totals_fac %>%
+      filter(rpt_mth == max (rpt_mth))
+    
+    if (rateperc == 'rate') {labels$lab <- paste0(round(labels$rate,1)) }
+    if (rateperc == 'perc') {labels$lab <- paste0(round(labels$perc,1),'%') }   
+
+    # facet by ICB with national dotty line
+    p <- ggplot(icb_totals_fac) +
+      geom_line(aes(x = rpt_mth,
+                    y = !!sym(rateperc))) +
+      geom_text(data = labels, aes(x= rpt_mth, y=!!sym(rateperc), label = lab)  , nudge_x = 150) +
+      coord_cartesian(clip = 'off')
+ 
+    if (area == 'SW') {
+      p <-
+        p + facet_wrap( ~ stp_name_short,
+                       ncol = 3,
+                        
+                        strip.position = "top")
+    }
+    if (area == 'region') {
+      p <-
+        p + facet_wrap( ~ new_region_name,
+                         nrow = 3,
+                                    strip.position = "top")
+    }
+    
+     icb_totals_fac <- icb_totals_fac %>%
+      group_by(rpt_mth) %>%
+      mutate (min_a = min(!!sym(rateperc)),
+              max_a = max(!!sym(rateperc))) %>%
+      ungroup() ## %>% filter (rpt_mth == '2022-01-31', stp_name_short == 'Devon')  ##test filter
+    
+    # calculates national position to add to charts
+    nat_dat <-
+      dat('national', group1, filter1, group2, filter2, group3, filter3) %>%
+      rename (national = new_region_name)
+    if (group != '') {
+      nat_dat <- nat_dat %>%
+        filter (!!sym(group) == filter)
+    }
+    
+    # adds national position as a dotty line
+    p <- p + geom_line(
+      data =  nat_dat,
+      aes(x = rpt_mth,
+          y = !!sym(rateperc)),
+      colour = "blue",
+      linetype = "dashed"
+    ) +    
+      # adds in ribbon for min and max values
+      geom_ribbon(data = icb_totals_fac, 
+                  aes(x = rpt_mth,
+                      ymin = min_a,
+                      ymax = max_a,
+                  alpha = 1/10), alpha = 0.1) +
+      theme_minimal()
+    p
+  }
+
+#ribbon_plot_fun  ('SW', group1, filter1, group2, filter2, group3, filter3, 'rate')
+
+library('ggthemes')
+#a <- ribbon_plot_fun  ('SW', group1, filter1, group2, filter2, group3, filter3, 'rate')
+#b <- ptd_plt (data, 'new_region_name', 'rate', FALSE, 'Rate of Appointments', NULL) 
+# grid.arrange(a, b, ncol = 2)
+
+################
+# SPC function #
+################
+
+ptd_plt <- function (data, facet, var, perc, ylab, title) {
+  latest_mth <- max(data$rpt_mth)
+  start_spc <- latest_mth %m+% months (-19)
+  data <- data %>%
+    dplyr::filter (rpt_mth >= start_spc)
+  p <- ptd_spc(
+    data,
+    value_field = !!sym(var),
+    date_field = rpt_mth,
+    facet_field = !!sym(facet),
+    improvement_direction =  'increase'
+  )
+  p <- ptd_create_ggplot(
+    p,
+    icons_position = 'none',
+    x_axis_date_format = "%b-%y",
+    percentage_y_axis = perc,
+    point_size = 2,
+    x_axis_label = NULL,
+    y_axis_label = ylab,
+    main_title	= title
+  )
+  p + theme( panel.border = element_blank(),
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             plot.background = element_rect(color = "white", size = 1))
+}
+
+#data <- dat('region','','','','','','')
+#b <- ptd_plt (data, 'new_region_name', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+#a <- plot(pressure)
+
+#grid.arrange(a,b, ncol = 2)
+
+#################################
+#Seasonality and forecast plots #
+#################################
+
+# dummy variables for testing
+#area <- 'SW'
+#group1<- ''
+#filter1 <-  ''
+
+#group1<- 'hcp_type'
+#filter1 <-  'GP'
+#group2<- 'timeliness_sd'
+#filter2 <-  '1'
+#group2<- ''
+#filter2 <-  ''
+#group3<-''
+#filter3 <- ''
+#rateperc <- 'rate'
+#rateperc <- 'perc'
+# system <- 'Devon'
+
+season_forecast_fun <- function (group1, filter1, group2, filter2, group3, filter3, system) {
+  # all
+  dat_tt <-dat('SW', group1, filter1, group2, filter2, group3, filter3)
+  
+  ts_dat <- dat_tt %>%
+    filter (stp_name_short == system)
+  
+  group <- case_when (group3 != '' ~ group3,
+                        group2 != '' ~ group2,
+                        group1 != '' ~ group1,
+                        TRUE ~ '')
+    
+  filter <- case_when (filter3 != '' ~ filter3,
+                         filter2 != '' ~ filter2,
+                         filter1 != '' ~ filter1,
+                         TRUE ~ '')
+    
+  if (group != '') {
+      ts_dat <- ts_dat %>%
+        filter (!!sym(group) == filter)
+    }
+  
+    # create a vector
+  z <- as.vector(ts_dat$rate)
+  
+  # convert to time series
+  ts_a <- ts(z, frequency = 12, start = c(2018, 1))
+  
+  # decompose
+  apt_season <- decompose(ts_a)
+  
+  # plot decomposition
+  a <- autoplot(apt_season) + theme_minimal()
+  
+  apt <- hw(ts_a, h = 12)
+  b <- autoplot(apt)+ theme_minimal()
+  
+  grid.arrange(a, b, ncol = 2)
+}
+
+##########################################
+
+prop_data <- com_reg %>% filter (new_region_name == 'SOUTH WEST')
+
+year_ago <- max(prop_data$rpt_mth) %m-% years(1)
+
+prop_data <- prop_data %>%
+  filter(rpt_mth >= year_ago) %>%
+  group_by (stp_name_short, hcp_type,) %>%
+  summarise(tot_appts = sum(count_of_appointments)) %>%
+  ungroup() %>%
+  group_by (stp_name_short) %>%
+  mutate(overall = sum(tot_appts),
+         perc = round((tot_appts / overall)*100,1),
+         labels = paste0(perc,'%')
+         )
+
+prop_data_plot <- prop_data %>% 
+  ggplot(aes(x = reorder(hcp_type, perc),y = perc, fill = perc)) + 
+  geom_bar(stat = "identity") +
+  geom_text(
+    data = prop_data,
+    aes(x = hcp_type,
+        y = 90,
+        label =  labels),
+    size = 4,
+    colour = 'blue'
+  ) +
+  ylim(0,100) +
+  coord_flip() + 
+  facet_wrap(~ stp_name_short, ncol = 3, strip.position="top") + 
+  theme_minimal() + 
+  theme (legend.position = "bottom", 
+         axis.title.x=element_blank(),
+         axis.text.x=element_blank(),
+         axis.title.y=element_blank()
+
+  ) 
+
+
+prop_data <- com_reg %>% 
+  filter (new_region_name == 'SOUTH WEST',
+          hcp_type %in% c('GP','Other Practice staff'))
+
+year_ago <- max(prop_data$rpt_mth) %m-% years(1)
+
+prop_data <- prop_data %>%
+  filter(rpt_mth >= year_ago) %>%
+  group_by (stp_name_short, hcp_type, appointment_mode) %>%
+  summarise(tot_appts = sum(count_of_appointments)) %>%
+  ungroup() %>%
+  group_by (stp_name_short) %>%
+  mutate(overall = sum(tot_appts),
+         labels = round((tot_appts / overall)*100,1),
+         perc = if_else(hcp_type == 'Other Practice staff', 
+                        labels*-1, 
+                        labels),
+         labels = paste0(labels,'%'),
+         position = if_else(hcp_type == 'Other Practice staff', -80, 80))
+
+prop_datac <- prop_data %>%
+  filter (hcp_type %in% c('GP','Other Practice staff'))
+          #stp_name_short == 'Devon')
+
+#prop_datac <- prop_data %>%
+ # filter (hcp_type %in% c('Unknown'))
+#stp_name_short == 'Devon')
+
+prop_data_plot_hcp <- prop_datac %>% 
+  ggplot(aes(x = reorder(appointment_mode, 
+                         abs(perc)),
+             y = perc, 
+             fill = hcp_type)) + 
+  geom_bar(stat = "identity") +
+  geom_text(
+    data = prop_datac,
+    aes(x = appointment_mode,
+        y = position,
+        label =  labels),
+    size = 4,
+    colour = 'blue'
+  ) +
+  ylim(-100,100) +
+  coord_flip() + 
+  facet_wrap(~ stp_name_short, 
+             ncol = 3, 
+             strip.position="top") + 
+  theme_minimal() + 
+  theme (legend.position = "bottom", 
+         axis.title.x=element_blank(),
+         axis.text.x=element_blank(),
+         axis.title.y=element_blank()
+         ) 
+
+###############################################
+# proportion table
+
+prop_dat <- com_reg %>% 
+  filter (rpt_mth == '2022-07-31', stp_name_short != 'Non South West') %>%
+  group_by(stp_name,stp_name_short,rpt_mth,hcp_type, appointment_mode, time_between_book_and_appt) %>%
+  summarise(appts_tot = sum(count_of_appointments)) %>%
+  ungroup() %>%
+  #select (-rpt_mth) %>%
+  group_by (stp_name_short, stp_name) %>%
+  mutate (percent = (appts_tot / sum(appts_tot))) %>%
+  ungroup()
+  
+prop_dat <- std_rate(prop_dat) %>%
+  select (-c(stp_name,rpt_mth, start_mth, workdays, pop_fac, stan_appts)) %>%
+  mutate (rate = round (rate,1))
+
+prop_dat$time_between_book_and_appt <- factor(prop_dat$time_between_book_and_appt, 
+                                              levels=c('Same Day', '1 Day', '2 to 7 Days', '8  to 14 Days', '15  to 21 Days','22  to 28 Days','More than 28 Days','Unknown / Data Quality'))
+
+prop_table <- reactable(prop_dat,
+          filterable = TRUE,
+          #defaultSorted = c('Same Day', '1 Day', '2 to 7 Days', '8  to 14 Days', '15  to 21 Days','22  to 28 Days','More than 28 Days','Unknown / Data Quality'),
+          groupBy = c('stp_name_short', 'hcp_type' , 'appointment_mode'),  
+          minRows = 10,
+          columns = list (
+            appts_tot = colDef(aggregate = "sum", name = "Total Appts", align = "left") ,
+            rate = colDef(aggregate = "sum", name = "Weighted Appts", align = "right", format = colFormat(digits = 1)),
+            percent =colDef(aggregate = "sum", name = "Percent of Total Appts", align = "left", format = colFormat(percent = TRUE, digits = 1)) 
+             ))
+
+prop_table_time <- reactable(prop_dat,
+          filterable = TRUE,
+          #defaultSorted = c('Same Day', '1 Day', '2 to 7 Days', '8  to 14 Days', '15  to 21 Days','22  to 28 Days','More than 28 Days','Unknown / Data Quality'),
+          groupBy = c('stp_name_short', 'time_between_book_and_appt','hcp_type'),  
+          minRows = 10,
+          columns = list (
+            appts_tot = colDef(aggregate = "sum", name = "Total Appts", align = "left") ,
+            rate = colDef(aggregate = "sum", name = "Weighted Appts", align = "right", format = colFormat(digits = 1)),
+            percent =colDef(aggregate = "sum", name = "Percent of Total Appts", align = "left", format = colFormat(percent = TRUE, digits = 1)) 
+             ))
+
+
+workflow <- DiagrammeR::grViz("digraph {
+
+graph [layout = dot, rankdir = LR]
+
+# define the global styles of the nodes. We can override these in box if we wish
+node [shape = rectangle, style = filled, fillcolor = Linen]
+
+data1 [label = 'UKHF \n raw data', shape = folder, fillcolor = Beige]
+combine [label = 'Date standardisation \n Appts / working days in month']
+process [label =  'Population standardision \n convert to rate per 100,000 \n gp reg population']
+statistical [label = 'Statistical \n Analysis \n ']
+results [label= 'Output \n Report', fillcolor = Yellow]
+
+# edge definitions with the node IDs
+data1 -> combine -> process -> statistical -> results}")
+
+###########################
+# daily calendar heatmaps #
+###########################
+
+cal <- com_reg %>%
+  filter (new_region_name == 'SOUTH WEST',
+          appointment_date >= as.Date('2020-01-01')) %>%
+  group_by (appointment_date) %>%
+  summarise(appointments = sum(count_of_appointments))
+
+dates <- ymd(cal$appointment_date)
+values <- cal$appointments
+
+all_appts <-
+  calendarHeatmap(dates, 
+                  values, 
+                  title = "South West Region - Daily Appointments",
+                  subtitle = "All types",
+                  legendtitle = "Count of appointments")
+
+cal <- com_reg %>%
+  filter (new_region_name == 'SOUTH WEST',
+          hcp_type == 'GP') %>%
+  group_by (appointment_date) %>%
+  summarise(appointments = sum(count_of_appointments))
+
+dates <- ymd(cal$appointment_date)
+values <- cal$appointments
+
+gp_appts <-
+  calendarHeatmap(dates, 
+                  values, 
+                  title = "South West Region - Daily Appointments",
+                  subtitle = "Appointments with GP only",
+                  legendtitle = "Count of appointments")
+
+cal <- com_reg %>%
+  filter (new_region_name == 'SOUTH WEST',
+          hcp_type == 'GP',
+          appointment_mode == 'Face-to-Face') %>%
+  group_by (appointment_date) %>%
+  summarise(appointments = sum(count_of_appointments))
+
+dates <- ymd(cal$appointment_date)
+values <- cal$appointments
+
+ftf_gp_appts <-
+  calendarHeatmap(dates, 
+                  values, 
+                  title = "South West Region - Daily Appointments",
+                  subtitle = "Face to face appointments with GP only",
+                  legendtitle = "Count of appointments")
+
+cal <- com_reg %>%
+  filter (new_region_name == 'SOUTH WEST',
+          hcp_type == 'GP',
+          timeliness_sd == '1') %>%
+  group_by (appointment_date) %>%
+  summarise(appointments = sum(count_of_appointments))
+
+dates <- ymd(cal$appointment_date)
+values <- cal$appointments
+
+sd_gp_appts <-
+  calendarHeatmap(dates, 
+                  values, 
+                  title = "South West Region - Daily Appointments",
+                  subtitle = "Same day appointments with GP only",
+                  legendtitle = "Same day appointments")
+
+cal <- com_reg %>%
+  filter (new_region_name == 'SOUTH WEST',
+          hcp_type == 'Other Practice staff') %>%
+  group_by (appointment_date) %>%
+  summarise(appointments = sum(count_of_appointments))
+
+dates <- ymd(cal$appointment_date)
+values <- cal$appointments
+
+ops_appts <-
+  calendarHeatmap(dates, 
+                  values, 
+                  title = "South West Region - Daily Appointments",
+                  subtitle = "Appointments with Other Practice staff only",
+                  legendtitle = "Count of appointments")
+
+cal <- com_reg %>%
+  filter (new_region_name == 'SOUTH WEST',
+          hcp_type == 'Other Practice staff',
+          appointment_mode == 'Face-to-Face') %>%
+  group_by (appointment_date) %>%
+  summarise(appointments = sum(count_of_appointments))
+
+dates <- ymd(cal$appointment_date)
+values <- cal$appointments
+
+ftf_ops_appts <-
+  calendarHeatmap(dates, 
+                  values, 
+                  title = "South West Region - Daily Appointments",
+                  subtitle = "Face to face appointments with Other Practice staff only",
+                  legendtitle = "Count of appointments")
+
+cal <- com_reg %>%
+  filter (new_region_name == 'SOUTH WEST',
+          hcp_type == 'Other Practice staff',
+          timeliness_sd == '1') %>%
+  group_by (appointment_date) %>%
+  summarise(appointments = sum(count_of_appointments))
+
+dates <- ymd(cal$appointment_date)
+values <- cal$appointments
+
+sd_ops_appts <-
+  calendarHeatmap(dates, 
+                  values, 
+                  title = "South West Region - Daily Appointments",
+                  subtitle = "Same day appointments with Other Practice staff only",
+                  legendtitle = "Same day appointments")
+
+#############################
+# change from 2019 baseline #
+#############################
+
+# rolling 12 months
+
+# SW systems
+
+rolling <- dat ('SW','','','','','','')
+
+rolling_latest <- max(rolling$rpt_mth)
+
+#baseline_mth <- rolling_latest %m+% months (-19)
+baseline_mth <- as.Date('2019-03-31')
+
+rolling <- rolling %>%
+  group_by(stp_name_short) %>%
+  mutate(roll_sum = rollsum(appts_tot, 12, align = "right", fill = NA)) %>%
+  filter (rpt_mth >= baseline_mth)
+
+base <- rolling %>%
+  filter (rpt_mth == baseline_mth)
+
+rolling <- rolling %>%
+  left_join (base, by = 'stp_name_short')
+
+rolling <- rolling %>% 
+  mutate (perc_change = ((roll_sum.x - roll_sum.y )/ roll_sum.y) * 100)
+
+
+# rolling SW systems plot
+
+rolling_sw_change <- rolling %>%
+  ggplot(aes(x=rpt_mth.x,
+             y= perc_change)) +
+geom_line() +
+  geom_line() +
+  geom_hline(yintercept = 0, 
+             colour = "blue",
+             linetype = "dashed") +
+#geom_hline(aes (yintercept = perc_change), linetype="dashed", color = "blue") +
+facet_wrap(~stp_name_short) +
+  ylab("Percentage change") +
+  theme_minimal() + 
+    theme (
+          legend.position = "none",
+          axis.title.x = element_blank()
+        )
+
+dat_lat <- rolling %>%
+  filter (rpt_mth.x == max(rpt_mth.x)) %>%
+  mutate(change = (round(((roll_sum.x -  roll_sum.y) / roll_sum.y) * 100 ,1)),
+         perc_change = paste0(change,'%'))
+
+baseline_change_bar_sw <- ggplot (data = dat_lat,
+        aes(
+          x = change,
+          y = reorder(stp_name_short, change),
+          fill = change
+        )) + geom_col() + 
+    geom_text(aes(x = change + 5,
+        y = stp_name_short,
+        label =  perc_change),
+    size = 4,
+    colour = 'blue'
+  ) +
+  xlab ("Latest percentage change") +
+  theme_minimal() +   
+  theme (
+          legend.position = "none",
+          #axis.title.x = element_blank(),
+          #axis.text.x = element_blank(),
+          axis.title.y = element_blank()
+        )
+
+##############
+
+# regional charts
+
+# rolling 12 months
+rolling <- dat ('region','','','','','','')
+
+rolling_latest <- max(rolling$rpt_mth)
+
+#baseline_mth <- rolling_latest %m+% months (-19)
+baseline_mth <- as.Date('2019-03-31')
+
+rolling <- rolling %>%
+  group_by(new_region_name) %>%
+  mutate(roll_sum = rollsum(appts_tot, 12, align = "right", fill = NA)) %>%
+  filter (rpt_mth >= baseline_mth)
+
+
+base <- rolling %>%
+  filter (rpt_mth == baseline_mth)
+
+rolling <- rolling %>%
+  left_join (base, by = 'new_region_name')
+
+rolling <- rolling %>% 
+  mutate (perc_change = ((roll_sum.x - roll_sum.y )/ roll_sum.y) * 100)
+
+
+# rolling regional plot
+
+rolling_reg_change <- rolling %>%
+  ggplot(aes(x=rpt_mth.x,
+             y= perc_change)) +
+geom_line() +
+  geom_hline(yintercept = 0, 
+             colour = "blue",
+             linetype = "dashed") +
+#geom_hline(aes (yintercept = perc_change), linetype="dashed", color = "blue") +
+facet_wrap(~new_region_name) +
+  ylab("Percentage change") +
+  theme_minimal() + 
+    theme (
+          legend.position = "none",
+          axis.title.x = element_blank()
+        )
+
+dat_lat <- rolling %>%
+  filter (rpt_mth.x == max(rpt_mth.x)) %>%
+  mutate(change = (round(((roll_sum.x -  roll_sum.y) / roll_sum.y) * 100 ,1)),
+         perc_change = paste0(change,'%'))
+
+baseline_change_bar_reg <- ggplot (data = dat_lat,
+        aes(
+          x = change,
+          y = reorder(new_region_name, change),
+          fill = change
+        )) + 
+  geom_col() +
+    geom_text(aes(x = change + 5,
+        y = new_region_name,
+        label =  perc_change),
+    size = 4,
+    colour = 'blue'
+  ) +
+  xlab ("Latest percentage change") +
+  theme_minimal() +   
+  theme (
+          legend.position = "none",
+          #axis.title.x = element_blank(),
+          #axis.text.x = element_blank(),
+          axis.title.y = element_blank()
+        ) 
+
+#######################
+
+
+
+## summary data
+
+#dat_sum <- filt_data_sw('','','')
+
+# data_base <- dat_sum %>%
+#   filter (between(rpt_mth, '2018-04-30', '2019-03-31')) %>%
+#   group_by(stp_name_short) %>%
+#   summarise(total_rpts_base = sum(appts_tot) )
+# 
+# dat_lat <- dat_sum %>%
+#   filter (rpt_mth >= year_ago+1) %>%
+#   group_by(stp_name_short) %>%
+#   summarise(total_rpts_late = sum(appts_tot) )
+# 
+# data_base_sw <- data_base %>%
+#   left_join(dat_lat, by = 'stp_name_short') %>%
+#   mutate(perc_change = round(((total_rpts_late-total_rpts_base)/ total_rpts_base) *100 ,1))
+# 
+# dat_sum_r <- filt_data_region('','','')
+# 
+# data_base_r <- dat_sum_r %>%
+#   filter (between(rpt_mth, '2018-04-30', '2019-03-31')) %>%
+#   group_by(new_region_name) %>%
+#   summarise(total_rpts_base = sum(appts_tot) )
+# 
+# dat_lat_r <- dat_sum_r %>%
+#   filter (rpt_mth >= year_ago+1) %>%
+#   group_by(new_region_name) %>%
+#   summarise(total_rpts_late = sum(appts_tot) )
+# 
+# data_base_s <- data_base_r %>%
+#   left_join(dat_lat_r, by = 'new_region_name') %>%
+#   mutate(perc_change = round(((total_rpts_late - total_rpts_base)/ total_rpts_base) *100 ,1),
+#          perc = (total_rpts_base/ total_rpts_late)*100)
+# 
+# 
+# #  rate per 10,000
+# latest_month <- max(com_reg$rpt_mth)
+# 
+# dat_latest_month_r <- dat_sum_r %>%
+#   filter (rpt_mth ==latest_month)
+# 
+# # max appts stp
+# dat_latest_month_r$new_region_name[dat_latest_month_r$rate == max(dat_latest_month_r$rate)]
+# 
+# # max appts num
+# round(dat_latest_month_r$rate[dat_latest_month_r$rate == max(dat_latest_month_r$rate)],1)
+# 
+# # min appts stp
+# dat_latest_month_r$new_region_name[dat_latest_month_r$rate == min(dat_latest_month_r$rate)]
+# 
+# # min appts num
+# round(dat_latest_month_r$rate[dat_latest_month_r$rate == min(dat_latest_month_r$rate)],1)
+# 
+# # add a rank to regions
+# dat_latest_month_r$rank <-  8 - rank(dat_latest_month_r$rate)
+# 
+# # region sw rank in words
+# ordinal(dat_latest_month_r$rank[dat_latest_month_r$new_region_name == 'SOUTH WEST'])
+# 
+# dat_latest_month <- dat_sum %>%
+#   filter (rpt_mth ==latest_month)
+# 
+# # max appts region
+# dat_latest_month$stp_name_short[dat_latest_month$rate == max(dat_latest_month$rate)]
+# 
+# # max appts num region
+# round(dat_latest_month$rate[dat_latest_month$rate == max(dat_latest_month$rate)],1)
+# 
+# # min appts stp region
+# dat_latest_month$stp_name_short[dat_latest_month$rate == min(dat_latest_month$rate)]
+# 
+# # min appts num region
+# round(dat_latest_month$rate[dat_latest_month$rate == min(dat_latest_month$rate)],1)
+
+
+#  region
+
+# same day appointments  sys
+#sd_sum_r <- filt_data_region('timeliness_sd','','')
+#sd_sum_r <- sd_sum_r %>%
+#  filter (rpt_mth ==latest_month) %>%
+#  group_by(new_region_name) %>%
+#  mutate (tot = sum(appts_tot),
+#          perc = round((appts_tot/ tot)*100,1)) %>%
+#  filter(timeliness_sd == 1)
+
+# max sd stp
+#sd_sum_r$new_region_name[sd_sum_r$perc == max(sd_sum_r$perc)]
+
+# max appts num
+#round(sd_sum_r$perc[sd_sum_r$perc == max(sd_sum_r$perc)],1)
+
+# min appts stp
+#sd_sum_r$new_region_name[sd_sum_r$perc == min(sd_sum_r$perc)]
+
+# min appts num
+#round(sd_sum_r$perc[sd_sum_r$perc == min(sd_sum_r$perc)],1)
+
+# add a rank to regions
+#sd_sum_r$rank <-  8 - rank(sd_sum_r$perc)
+
+# region sw rank in words
+#ordinal(sd_sum_r$rank[dat_latest_month_r$new_region_name == 'SOUTH WEST'])
+
+
+
+# same day appointments  sw
+#sd_sum <- filt_data_sw('timeliness_sd','','')
+#sd_sum <- sd_sum %>%
+#  filter (rpt_mth ==latest_month) %>%
+#  group_by(stp_name_short) %>%
+#  mutate (tot = sum(appts_tot),
+#          perc = round((appts_tot/ tot)*100,1)) %>%
+#  filter(timeliness_sd == 1)
+
+
+
+# gp appointments  sw
+#gp_sum <- filt_data_sw('hcp_type','','')
+#gp_sum <- gp_sum %>%
+#  filter (rpt_mth ==latest_month) %>%
+#  group_by(stp_name_short) %>%
+#  mutate (tot = sum(appts_tot),
+#          perc = round((appts_tot/ tot)*100,1)) %>%
+#  filter(hcp_type == 'GP')
+
+
+# gp appointments  sw
+#gp_sum_sd <- filt_data_sw('hcp_type','timeliness_sd','')
+#gp_sum_sd <- gp_sum_sd %>%
+#  filter (rpt_mth ==latest_month) %>%
+#  group_by(stp_name_short) %>%
+#  mutate (tot = sum(appts_tot),
+#          perc = round((appts_tot/ tot)*100,1)) %>%
+#  filter(hcp_type == 'GP')
+
+
+# test dummy variables
+#area <- 'SW'
+#group1<- 'hcp_type'
+#filter1 <- 'GP'
+#group2<-'timeliness_sd'
+#filter2 <- '1'
+#group3<-''
+#filter3<-''
+
+# function to filter, group and add std rates and percentages
+# groups data at up to two levels and then filters on a final level
+# for example this gives gp appts/face2face and then timeliness
+# adds the percentage as well as a standardised rate
+
+sum_gp <- dat ('SW',
+            'hcp_type',
+            'GP',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          hcp_type == 'GP')  |>
+  select (stp_name_short,
+          perc) |>
+  rename(ICB = stp_name_short,
+    `% With a GP` = perc )
+
+sum_sd <- dat ('SW',
+            'timeliness_sd',
+            '1',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          timeliness_sd == '1')  |>
+  select (stp_name_short,
+          perc) |>
+  rename(ICB = stp_name_short,
+    `% Same day` = perc )
+
+sum_14 <- dat ('SW',
+            'timeliness_14',
+            '1',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          timeliness_14 == '1')  |>
+  select (stp_name_short,
+          perc) |>
+  rename(ICB = stp_name_short,
+    `% Within 14 days` = perc )
+
+sum_ftf_gp <- dat ('SW',
+            'appointment_mode',
+            'Face-to-Face',
+            'hcp_type',
+            'GP',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          hcp_type == 'GP')  |>
+  select (stp_name_short,
+          perc) |>
+  rename(ICB = stp_name_short,
+    `% F2F with a GP` = perc )
+
+sum_ftf <- dat ('SW',
+            'appointment_mode',
+            'Face-to-Face',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          appointment_mode == 'Face-to-Face')  |>
+  select (stp_name_short,
+          perc) |>
+  rename(ICB = stp_name_short,
+    `% Face to Face` = perc )
+
+sum_rate <- dat ('SW',
+            '',
+            '',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth)  |>
+  select (stp_name_short,
+          rate) |>
+  rename(ICB = stp_name_short,
+    `Appointments per 10,000 patients` = rate )
+
+
+#### national
+
+nat_sum_gp <- dat ('national',
+            'hcp_type',
+            'GP',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          hcp_type == 'GP')  |>
+  select (new_region_name,
+          perc) |>
+  rename(ICB = new_region_name,
+    `% With a GP` = perc )
+
+nat_sum_sd <- dat ('national',
+            'timeliness_sd',
+            '1',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          timeliness_sd == '1')  |>
+  select (new_region_name,
+          perc) |>
+  rename(ICB = new_region_name,
+    `% Same day` = perc )
+
+nat_sum_14 <- dat ('national',
+            'timeliness_14',
+            '1',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          timeliness_14 == '1')  |>
+  select (new_region_name,
+          perc) |>
+  rename(ICB = new_region_name,
+    `% Within 14 days` = perc )
+
+nat_sum_ftf_gp <- dat ('national',
+            'appointment_mode',
+            'Face-to-Face',
+            'hcp_type',
+            'GP',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          hcp_type == 'GP')  |>
+  select (new_region_name,
+          perc) |>
+  rename(ICB = new_region_name,
+    `% F2F with a GP` = perc )
+
+nat_sum_ftf <- dat ('national',
+            'appointment_mode',
+            'Face-to-Face',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          appointment_mode == 'Face-to-Face')  |>
+  select (new_region_name,
+          perc) |>
+  rename(ICB = new_region_name,
+    `% Face to Face` = perc )
+
+nat_sum_rate <- dat ('national',
+            '',
+            '',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          new_region_name == 'National')  |>
+  select (new_region_name,
+          rate) |>
+  rename(ICB = new_region_name,
+    `Appointments per 10,000 patients` = rate )
+
+
+############
+# region
+
+reg_sum_gp <- dat ('region',
+            'hcp_type',
+            'GP',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          hcp_type == 'GP',
+          new_region_name == 'SOUTH WEST')  |>
+  select (new_region_name,
+          perc) |>
+  rename(ICB = new_region_name,
+    `% With a GP` = perc )
+
+reg_sum_sd <- dat ('region',
+            'timeliness_sd',
+            '1',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          timeliness_sd == '1',
+          new_region_name == 'SOUTH WEST')  |>
+  select (new_region_name,
+          perc) |>
+  rename(ICB = new_region_name,
+    `% Same day` = perc )
+
+reg_sum_14 <- dat ('region',
+            'timeliness_14',
+            '1',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          timeliness_14 == '1',
+          new_region_name == 'SOUTH WEST')  |>
+  select (new_region_name,
+          perc) |>
+  rename(ICB = new_region_name,
+    `% Within 14 days` = perc )
+
+reg_sum_ftf_gp <- dat ('region',
+            'appointment_mode',
+            'Face-to-Face',
+            'hcp_type',
+            'GP',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          hcp_type == 'GP',
+          new_region_name == 'SOUTH WEST')  |>
+  select (new_region_name,
+          perc) |>
+  rename(ICB = new_region_name,
+    `% F2F with a GP` = perc )
+
+reg_sum_ftf <- dat ('region',
+            'appointment_mode',
+            'Face-to-Face',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          appointment_mode == 'Face-to-Face',
+          new_region_name == 'SOUTH WEST')  |>
+  select (new_region_name,
+          perc) |>
+  rename(ICB = new_region_name,
+    `% Face to Face` = perc )
+
+reg_sum_rate <- dat ('region',
+            '',
+            '',
+            '',
+            '',
+            '',
+            '') |>
+  filter (rpt_mth == latest_mth,
+          new_region_name == 'SOUTH WEST')  |>
+  select (new_region_name,
+          rate) |>
+  rename(ICB = new_region_name,
+    `Appointments per 10,000 patients` = rate )
+
+#
+# join tables
+
+sum <- sum_sd |>
+  left_join(sum_14, by = 'ICB') |>
+  left_join(sum_ftf, by = 'ICB') |>
+  left_join(sum_gp, by = 'ICB') |>
+  left_join(sum_ftf_gp, by = 'ICB') |>
+  left_join(sum_rate, by = 'ICB') 
+    
+nat_sum <- nat_sum_sd |>
+  left_join(nat_sum_14, by = 'ICB') |>
+  left_join(nat_sum_ftf, by = 'ICB') |>
+  left_join(nat_sum_gp, by = 'ICB') |>
+  left_join(nat_sum_ftf_gp, by = 'ICB') |>
+  left_join(nat_sum_rate, by = 'ICB') 
+
+reg_sum <- reg_sum_sd |>
+  left_join(reg_sum_14, by = 'ICB') |>
+  left_join(reg_sum_ftf, by = 'ICB') |>
+  left_join(reg_sum_gp, by = 'ICB') |>
+  left_join(reg_sum_ftf_gp, by = 'ICB') |>
+  left_join(reg_sum_rate, by = 'ICB') 
+
+all_sum <- rbind(nat_sum, reg_sum, sum)
+
+library(gt)
+
+col_neg <- "#ED8B00"
+col_pos <- "#78BE20"
+
+sum_table <-all_sum |> gt() |>
+  tab_style(
+    style = list(
+      cell_fill(color = col_neg)),
+    locations = cells_body(
+      columns = `% Same day`,
+      rows = `% Same day` < (nat_sum$`% Same day`-5)
+    )
+  ) |>
+  tab_style(
+    style = list(
+      cell_fill(color = col_neg)),
+    locations = cells_body(
+      columns = `% Within 14 days`,
+      rows = `% Within 14 days` < (nat_sum$`% Within 14 days`-5)
+    )
+  ) |>  
+    tab_style(
+    style = cell_borders(
+      sides = "bottom",
+      color = "red",
+      weight = px(4),
+      style = "solid"
+    ),
+    locations = cells_body(
+      columns = everything(),
+      rows = 2
+    )
+  ) |> 
+  tab_style(
+    style = list(
+      cell_fill(color = col_neg)),
+    locations = cells_body(
+      columns = `% Face to Face`,
+      rows = `% Face to Face` < (nat_sum$`% Face to Face`-5)
+    )
+  ) |>
+  tab_style(
+    style = list(
+      cell_fill(color = col_neg)),
+    locations = cells_body(
+      columns = `% With a GP`,
+      rows = `% With a GP` < (nat_sum$`% With a GP`-5)
+    )
+  ) |>  
+  tab_style(
+    style = list(
+      cell_fill(color = col_neg)),
+    locations = cells_body(
+      columns = `% F2F with a GP`,
+      rows = `% F2F with a GP` < (nat_sum$`% F2F with a GP`-5)
+    )
+  ) |>  
+  tab_style(
+    style = list(
+      cell_fill(color = col_neg)),
+    locations = cells_body(
+      columns = `Appointments per 10,000 patients`,
+      rows = `Appointments per 10,000 patients` < (nat_sum$`Appointments per 10,000 patients`-250)
+    )
+  ) |>
+  tab_style(
+    style = list(
+      cell_fill(color = col_pos)),
+    locations = cells_body(
+      columns = `% Same day`,
+      rows = `% Same day` > (nat_sum$`% Same day`+5)
+    )
+  ) |>
+  tab_style(
+    style = list(
+      cell_fill(color = col_pos)),
+    locations = cells_body(
+      columns = `% Within 14 days`,
+      rows = `% Within 14 days` > (nat_sum$`% Within 14 days`+5)
+    )
+  ) |>  
+  tab_style(
+    style = list(
+      cell_fill(color = col_pos)),
+    locations = cells_body(
+      columns = `% Face to Face`,
+      rows = `% Face to Face` > (nat_sum$`% Face to Face`+5)
+    )
+  ) |>
+  tab_style(
+    style = list(
+      cell_fill(color = col_pos)),
+    locations = cells_body(
+      columns = `% With a GP`,
+      rows = `% With a GP` > (nat_sum$`% With a GP`+5)
+    )
+  ) |>  
+  tab_style(
+    style = list(
+      cell_fill(color = col_pos)),
+    locations = cells_body(
+      columns = `% F2F with a GP`,
+      rows = `% F2F with a GP` > (nat_sum$`% F2F with a GP`+5)
+    )
+  ) |>  
+  tab_style(
+    style = list(
+      cell_fill(color = col_pos)),
+    locations = cells_body(
+      columns = `Appointments per 10,000 patients`,
+      rows = `Appointments per 10,000 patients` > (nat_sum$`Appointments per 10,000 patients`+250)
+    )
+  )   |>
+  cols_align(
+  align = "center",
+  columns = everything()
+) |>
+  fmt_percent(
+  columns = starts_with('%'),
+  rows = everything(),
+  scale_values = FALSE,
+  decimals = 1
+) |>
+tab_footnote(
+  footnote = 'Green shows 5% above National, Amber shows 5% below National'
+)
+
+```
+
+About 
+===================================== 
+
+### Overview
+
+This is a dashboard to show GP appointment data for the South West Region'
+
+It covers data for the period `r  format(min(com_reg$appointment_date),'%B %Y')` to `r  format(max(com_reg$appointment_date),'%B %Y')`.
+
+This is an experimental statistics report.
+
+Experimental statistics are series of statistics that are in the testing phase and not yet fully developed for several reasons such as:
+
+- poor coverage
+- poor data quality
+- data undergoing evaluation
+
+This report is classed as experimental statistics due to variations in the quality of data contained within a number of fields.
+
+No patient identifiable information has been processed or is included in this report.
+
+#### Navigation
+
+Click on the systems above and select on the drop down menu the area you wish to explore.
+
+
+Row {.tabset .tabset-fade}
+-------------------------------------
+   
+### Data assumptions and methodology
+  
+Comparisons across systems is challenging due to the different sizes of populations that the systems serve. To adjust for this, raw appointment numbers have been standardised as rates per population to allow to equitable comparison.
+
+Monthly comparisons have been standardised by working days in month and converted to a rate per registered GP population.  This results a standardised working day rate per 100,000 registered GP population.   
+
+`r workflow`
+
+Raw appointment numbers combine face to face and telephony and other forms of contact.  This does not necessarily represent clinical contact time or quality of clinical contacts. 
+
+Timeliness calculations are based on referral to appointment time.  They do not include urgency levels, patient choice or clock stops.  Percentages are calculated against the total number of appointments and do not necessarily represent need.  
+
+Data taken from published UKHF datasets and is publicly available at https://digital.nhs.uk/data-and-information/publications/statistical/appointments-in-general-practice
+
+This report was run on `r format(Sys.Date(),'%d %B %Y')`
+
+### Credits
+
+Written in R Markdown using Flexdashboard  
+
+Simon Wellesley-Miller  
+*Senior Analytical Manager*
+
+Claire Royle  
+*Analytical Officer (Primary Care)* 
+
+
+South West Performance Analytics Team  
+Directorate of the Chief Data & Analytics Officer  
+
+**Health and high quality care for all, **  
+**now and for future generations **
+
+
+V1.1 01/12/2022
+
+
+> Contact
+Simon.Wellesley-Miller@nhs.net
+
+Regional and SW System Summary {data-navmenu="Summary"}
+===================================== 
+
+```{r}
+sum_table
+```
+
+
+From the summary table we can see there is small amount of variation within same day appointments, with all systems broadly in line with national. In the 14 day appointments where Gloucestershire, BSW and Dorset are also showing lower timeliness at the 14 day stage.   This needs to be taken into consideration either with a higher proportion of face to face appointments or a general higher rate of appointments per 100,000 population, where all but one system is higher than the national average and some quite significantly so.  
+
+Overall appointment rates continue a slowly increasing trend as a region, however Cornwall, Somerset and Devon, appear to be at a steady state, this appears to be a normal seasonal pattern.  We would expect things to reduce over the summer before increasing again in September.  
+
+In all systems we are seeing a steady increase in the number and proportion of face to face appointments. This is an increase by GP appointments with other HCP appointments settling to a steady rate.  
+
+As a rate by working day and standardised by population the SW region has the highest rate in the country and this is reflected in most systems. BNSSG below the national average but not significantly so.  
+
+We see a continuing trend in increase of face-to-face appointments. There is variation in practice, from 58% of appointments face to face in Somerset to 75% in Dorset, the national average being 70%.   
+
+The percentage proportion of appointments conducted by GPs is lower in the South West, however the overall rate of GP appointments is higher. This is due to high rates of appointments being conducted overall but with additional appointments being conducted by other health care professionals. Looking at the proportion needs to be done with care and understanding this context. We see the overall contacts by GP have increased as has the actual numbers of appointments have gone up, it is that the number of HCP appointments have gone up more.  
+
+We continue to see an increasing trend of GP appointments occurring face to face, but there is wide variation across systems. Of GP appointments 42% were face to face in Somerset compared to 71% in Dorset, the national average being 62%.  
+
+The proportion of same day appointments now seems to be steady nationally at around 44%  The South West is showing as the lowest proportion of same day appointments at 41%, however the variation is small with the highest Midlands at 45%. By South West systems, it varies from 39% in Dorset to 44% in Somerset and does not appear to be significant differences. The proportion follows a seasonal pattern and again looks to settle around this mark until winter.  
+
+This correlation between number of appointments and timeliness of appointments continues at the 14 day mark. Again, we see an overall decrease in 14 day timeliness nationally with the South West being the lowest at 78% against a national average of 81% with the highest London at 89%, this variation does not seem significant. Again, there seems to be a seasonal trend where would expect to see a reduction until winter.  
+
+In all systems we predict there will be an increasing trend, based on past patterns, this increase being driven by the other practice staff appointments.
+All this information is available within this dashboard which also shows trend comparisons and forecasts.
+
+
+
+
+
+All appointments {data-navmenu="SW Daily Heatmap"}
+===================================== 
+
+This shows a daily rate of appointments, there is a scale from red to green for the raw number of appointments.  This is aggregated up to the South West region and so will regress to the mean across all systems and practices.  Without doubt there will be elements of local variation and different practice models.  However this does give an overall view and shows peaks and troughs of activity.  It is clear that a higher number of appointments occur on a Monday and this is the day you are most key to be seen on the same day. It also highlights the seasonality of the vaccination programme.    
+
+Row
+-------------------------------------
+    
+### Regional Heatmap - All appointment types'
+
+```{r}
+
+all_appts
+
+```
+
+GP only appointments {data-navmenu="SW Daily Heatmap"}
+===================================== 
+
+This shows a daily rate of appointments, there is a scale from red to green for the raw number of appointments.  This is aggregated up to the South West region and so will regress to the mean across all systems and practices.  Without doubt there will be elements of local variation and different practice models.  However this does give an overall view and shows peaks and troughs of activity.  It is clear that a higher number of appointments occur on a Monday and this is the day you are most key to be seen on the same day. It also highlights the seasonality of the vaccination programme.  
+
+Row
+-------------------------------------
+    
+### Regional Heatmap - All appointment types
+
+```{r}
+
+gp_appts
+
+```
+
+GP only Face to Face appointments {data-navmenu="SW Daily Heatmap"}
+===================================== 
+
+This shows a daily rate of appointments, there is a scale from red to green for the raw number of appointments.  This is aggregated up to the South West region and so will regress to the mean across all systems and practices.  Without doubt there will be elements of local variation and different practice models.  However this does give an overall view and shows peaks and troughs of activity.  It is clear that a higher number of appointments occur on a Monday and this is the day you are most key to be seen on the same day. It also highlights the seasonality of the vaccination programme.    
+
+Row
+-------------------------------------
+    
+### Regional Heatmap - GP appointments only
+
+```{r}
+ftf_gp_appts
+
+```
+
+GP only Same Day appointments {data-navmenu="SW Daily Heatmap"}
+===================================== 
+
+This shows a daily rate of appointments, there is a scale from red to green for the raw number of appointments.  This is aggregated up to the South West region and so will regress to the mean across all systems and practices.  Without doubt there will be elements of local variation and different practice models.  However this does give an overall view and shows peaks and troughs of activity.  It is clear that a higher number of appointments occur on a Monday and this is the day you are most key to be seen on the same day. It also highlights the seasonality of the vaccination programme.    
+
+Row
+-------------------------------------
+    
+### Regional Heatmap - GP face to face appointments only 
+
+```{r }
+sd_gp_appts
+
+
+```
+
+Other Practice Staff appointments {data-navmenu="SW Daily Heatmap"}
+===================================== 
+
+This shows a daily rate of appointments, there is a scale from red to green for the raw number of appointments.  This is aggregated up to the South West region and so will regress to the mean across all systems and practices.  Without doubt there will be elements of local variation and different practice models.  However this does give an overall view and shows peaks and troughs of activity.  It is clear that a higher number of appointments occur on a Monday and this is the day you are most key to be seen on the same day. It also highlights the seasonality of the vaccination programme.     
+
+Row
+-------------------------------------
+    
+### Regional Heatmap - Other practice staff all appointments
+
+```{r}
+ops_appts
+
+```
+
+Other Practice Staff face to face appointments {data-navmenu="SW Daily Heatmap"}
+===================================== 
+
+This shows a daily rate of appointments, there is a scale from red to green for the raw number of appointments.  This is aggregated up to the South West region and so will regress to the mean across all systems and practices.  Without doubt there will be elements of local variation and different practice models.  However this does give an overall view and shows peaks and troughs of activity.  It is clear that a higher number of appointments occur on a Monday and this is the day you are most key to be seen on the same day. It also highlights the seasonality of the vaccination programme.      
+
+Row
+-------------------------------------
+    
+### Regional Heatmap - Other practice staff face to face appointments
+
+```{r }
+ftf_ops_appts
+
+
+```
+
+Other Practice Staff same day appointments {data-navmenu="SW Daily Heatmap"}
+===================================== 
+
+This shows a daily rate of appointments, there is a scale from red to green for the raw number of appointments.  This is aggregated up to the South West region and so will regress to the mean across all systems and practices.  Without doubt there will be elements of local variation and different practice models.  However this does give an overall view and shows peaks and troughs of activity.  It is clear that a higher number of appointments occur on a Monday and this is the day you are most key to be seen on the same day. It also highlights the seasonality of the vaccination programme.     
+
+Row
+-------------------------------------
+    
+### Regional Heatmap - Other practice staff same day appointments
+
+```{r }
+sd_ops_appts
+
+```
+
+
+Regional {data-navmenu="All appts"}
+===================================== 
+
+To the left we can see the standardised (by population) rates of appointments per working day with data going back to 2018.  This shows the position pre and post pandemic to give an indication of recovery.
+
+To the right the last 18 months of data is shown within statistical process control (SPC) graphs.  These show expected ranges of performance as well as identify any trends and outliers.  In short values outside the control lines show unexpected variance.  Yellow dots represent a values of a decreasing trend or special cause concern, whilst blue dots show a special cause improvement or an increasing trend.   
+
+Row
+-------------------------------------
+    
+### Regional Overview
+
+```{r  fig.width= 20}
+
+a <- ribbon_plot_fun  ('region', '', '', '','','', '', 'rate')
+data <- dat('region','','','','','','')
+b <- ptd_plt (data, 'new_region_name', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+
+SW Systems {data-navmenu="All appts"}
+===================================== 
+
+To the left we can see the standardised (by population) rates of appointments per working day with data going back to 2018.  This shows the position pre and post pandemic to give an indication of recovery.
+
+To the right the last 18 months of data is shown within statistical process control (SPC) graphs.  These show expected ranges of performance as well as identify any trends and outliers.  In short values outside the control lines show unexpected variance.  Yellow dots represent a values of a decreasing trend or special cause concern, whilst blue dots show a special cause improvement or an increasing trend.  
+
+
+Row
+-------------------------------------
+    
+### SW System Overview  
+
+```{r  fig.width= 20}
+
+a <- ribbon_plot_fun  ('SW', '', '', '','','', '', 'rate')
+data <- dat('SW','','','','','','')
+b <- ptd_plt (data, 'stp_name_short', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+
+```
+
+
+Types of appointments {data-navmenu="All appts"}
+===================================== 
+
+To the left we can see the standardised (by population) rates of appointments per working day with data going back to 2018.  This shows the position pre and post pandemic to give an indication of recovery.
+
+To the right the last 18 months of data is shown within statistical process control (SPC) graphs.  These show expected ranges of performance as well as identify any trends and outliers.  In short values outside the control lines show unexpected variance.  Yellow dots represent a values of a decreasing trend or special cause concern, whilst blue dots show a special cause improvement or an increasing trend.    
+
+This is the proportion of all appointments by that mode Obviously there is a trade off that as one mode increases, others decrease.  
+
+Row {.tabset}
+-------------------------------------
+    
+### Face to face
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'appointment_mode', 'Face-to-Face', '','','', '', 'perc')
+data <- dat('SW','appointment_mode','Face-to-Face','','','','')
+data <- data %>%
+  filter (appointment_mode == 'Face-to-Face')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Telephone
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'appointment_mode', 'Telephone', '','','', '', 'perc')
+data <- dat('SW','appointment_mode','Telephone','','','','')
+data <- data %>%
+  filter (appointment_mode == 'Telephone')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```    
+
+### DNA
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'appointment_status', 'DNA', '','','', '', 'perc')
+data <- dat('SW','appointment_status','DNA','','','','')
+data <- data %>%
+  filter (appointment_status == 'DNA')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+###################################################################################################
+```
+
+Regional {data-navmenu="Baseline Change"}
+===================================== 
+
+This is a percentage change from the 2018/19 baseline.  It is based on a rolling year and compares to that static (pre covid) baseline.
+
+Those regions with lower baselines could show a greater increase as the smaller numbers have a greater impact as a percentage.
+
+Row 
+-------------------------------------
+
+#### Regional Overview - Percentage change from 2019 baseline
+
+```{r fig.width= 17}
+grid.arrange(rolling_reg_change,baseline_change_bar_reg, ncol = 2 )
+
+
+```
+
+
+SW Systems {data-navmenu="Baseline Change"}
+===================================== 
+
+This is a percentage change from the 2018/19 baseline.  It is based on a rolling year and compares to that static (pre covid) baseline.
+
+Those regions with lower baselines could show a greater increase as the smaller numbers have a greater impact as a percentage.
+
+Due to a change in recording system in Cornwall, this system is showing a lower baseline, therefore they are showing the largest increase from this baseline.
+
+Row 
+-------------------------------------
+
+#### SW Systems Overview - Percentage change from 2019 baseline
+
+```{r fig.width= 17}
+grid.arrange(rolling_sw_change,baseline_change_bar_sw, ncol = 2 )
+```
+
+
+Regional {data-navmenu="GP Appointments only"}
+===================================== 
+
+This is isolated data for appointments with a GP only.
+
+To the left we can see the standardised (by population) rates of appointments per working day with data going back to 2018.  This shows the position pre and post pandemic to give an indication of recovery.
+
+To the right the last 18 months of data is shown within statistical process control (SPC) graphs.  These show expected ranges of performance as well as identify any trends and outliers.  In short values outside the control lines show unexpected variance.  Yellow dots represent a values of a decreasing trend or special cause concern, whilst blue dots show a special cause improvement or an increasing trend.    
+
+This is the proportion of all appointments by that mode Obviously there is a trade off that as one mode increases, others decrease.  
+
+Row {.tabset}
+-------------------------------------
+
+### Regional Overview - GP appointments as a percentage of total appointments
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('region', 'hcp_type', 'GP', '','','', '', 'perc')
+data <- dat('region','hcp_type','GP','','','','')
+data <- data %>%
+  filter (hcp_type == 'GP')
+b <- ptd_plt (data, 'new_region_name', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+
+### Regional Overview - GP appointments as a standardised rate
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('region', 'hcp_type', 'GP', '','','', '', 'rate')
+data <- dat('region','hcp_type','GP','','','','')
+data <- data %>%
+  filter (hcp_type == 'GP')
+b <- ptd_plt (data, 'new_region_name', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+    
+    
+System {data-navmenu="GP Appointments only"}
+===================================== 
+
+This is isolated data for appointments with a GP only.
+
+To the left we can see the standardised (by population) rates of appointments per working day with data going back to 2018.  This shows the position pre and post pandemic to give an indication of recovery.
+
+To the right the last 18 months of data is shown within statistical process control (SPC) graphs.  These show expected ranges of performance as well as identify any trends and outliers.  In short values outside the control lines show unexpected variance.  Yellow dots represent a values of a decreasing trend or special cause concern, whilst blue dots show a special cause improvement or an increasing trend.    
+
+This is the proportion of all appointments by that mode Obviously there is a trade off that as one mode increases, others decrease.  
+
+Row {.tabset}
+-------------------------------------
+    
+### SW Systems GP Appointments only - GP appointments as a percentage of total appointments
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', '','','', '', 'perc')
+data <- dat('SW','hcp_type','GP','','','','')
+data <- data %>%
+  filter (hcp_type == 'GP')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+
+```
+
+
+### SW Systems GP Appointments only - GP appointments as a standardised rate
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', '','','', '', 'rate')
+data <- dat('SW','hcp_type','GP','','','','')
+data <- data %>%
+  filter (hcp_type == 'GP')
+b <- ptd_plt (data, 'stp_name_short', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+```
+
+
+Types of appointments {data-navmenu="GP Appointments only"}
+===================================== 
+
+This is isolated data for appointments with a GP only.
+
+To the left we can see the standardised (by population) rates of appointments per working day with data going back to 2018.  This shows the position pre and post pandemic to give an indication of recovery.
+
+To the right the last 18 months of data is shown within statistical process control (SPC) graphs.  These show expected ranges of performance as well as identify any trends and outliers.  In short values outside the control lines show unexpected variance.  Yellow dots represent a values of a decreasing trend or special cause concern, whilst blue dots show a special cause improvement or an increasing trend.    
+
+This is the proportion of all appointments by that mode Obviously there is a trade off that as one mode increases, others decrease.    
+
+Row {.tabset}
+-------------------------------------
+    
+### Face to face
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'appointment_mode','Face-to-Face','', '', 'perc')
+data <- dat('SW','hcp_type','GP','appointment_mode','Face-to-Face','','')
+data <- data %>%
+  filter (appointment_mode == 'Face-to-Face')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Telephone
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'appointment_mode','Telephone','', '', 'perc')
+data <- dat('SW','hcp_type','GP','appointment_mode','Telephone','','')
+data <- data %>%
+  filter (appointment_mode == 'Telephone')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```    
+
+### DNA
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'appointment_status','DNA','', '', 'perc')
+data <- dat('SW','hcp_type','GP','appointment_status','DNA','','')
+data <- data %>%
+  filter (appointment_status == 'DNA')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+#########  GP END #########################!!!!!!!!!!!!!!!!
+```
+
+
+
+Regional {data-navmenu="Other Practice Staff only"}
+===================================== 
+
+This is isolated data for appointments with a other practice staff only.
+
+To the left we can see the standardised (by population) rates of appointments per working day with data going back to 2018.  This shows the position pre and post pandemic to give an indication of recovery.
+
+To the right the last 18 months of data is shown within statistical process control (SPC) graphs.  These show expected ranges of performance as well as identify any trends and outliers.  In short values outside the control lines show unexpected variance.  Yellow dots represent a values of a decreasing trend or special cause concern, whilst blue dots show a special cause improvement or an increasing trend.    
+
+Row {.tabset}
+-------------------------------------
+
+### Regional Overview - Other practice staff appointments as a percentage of total appointments
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('region', 'hcp_type', 'Other Practice staff', '','','', '', 'perc')
+data <- dat('region','hcp_type','Other Practice staff','','','','')
+data <- data %>%
+  filter (hcp_type == 'Other Practice staff')
+b <- ptd_plt (data, 'new_region_name', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+
+### Regional Overview - Other practice staff appointments as a standardised rate
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('region', 'hcp_type', 'Other Practice staff', '','','', '', 'rate')
+data <- dat('region','hcp_type','Other Practice staff','','','','')
+data <- data %>%
+  filter (hcp_type == 'Other Practice staff')
+b <- ptd_plt (data, 'new_region_name', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+    
+    
+System {data-navmenu="Other Practice Staff only"}
+===================================== 
+
+This is isolated data for appointments with a other practice staff only.
+
+To the left we can see the standardised (by population) rates of appointments per working day with data going back to 2018.  This shows the position pre and post pandemic to give an indication of recovery.
+
+To the right the last 18 months of data is shown within statistical process control (SPC) graphs.  These show expected ranges of performance as well as identify any trends and outliers.  In short values outside the control lines show unexpected variance.  Yellow dots represent a values of a decreasing trend or special cause concern, whilst blue dots show a special cause improvement or an increasing trend.    
+
+
+Row {.tabset}
+-------------------------------------
+    
+### SW Systems Other Practice staff Appointments only - Other Practice staff appointments as a percentage of total appointments
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', '','','', '', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','','','','')
+data <- data %>%
+  filter (hcp_type == 'Other Practice staff')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+
+```
+
+
+### SW Systems Other Practice staff Appointments only - Other Practice staff appointments as a standardised rate
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', '','','', '', 'rate')
+data <- dat('SW','hcp_type','Other Practice staff','','','','')
+data <- data %>%
+  filter (hcp_type == 'Other Practice staff')
+b <- ptd_plt (data, 'stp_name_short', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+```
+
+
+Types of appointments {data-navmenu="Other Practice Staff only"}
+===================================== 
+
+This is isolated data for appointments with a other practice staff only.
+
+To the left we can see the standardised (by population) rates of appointments per working day with data going back to 2018.  This shows the position pre and post pandemic to give an indication of recovery.
+
+To the right the last 18 months of data is shown within statistical process control (SPC) graphs.  These show expected ranges of performance as well as identify any trends and outliers.  In short values outside the control lines show unexpected variance.  Yellow dots represent a values of a decreasing trend or special cause concern, whilst blue dots show a special cause improvement or an increasing trend.    
+
+This is the proportion of all appointments by that mode Obviously there is a trade off that as one mode increases, others decrease.  
+
+Row {.tabset}
+-------------------------------------
+    
+### Face to face
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'appointment_mode','Face-to-Face','', '', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','appointment_mode','Face-to-Face','','')
+data <- data %>%
+  filter (appointment_mode == 'Face-to-Face')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Telephone
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'appointment_mode','Telephone','', '', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','appointment_mode','Telephone','','')
+data <- data %>%
+  filter (appointment_mode == 'Telephone')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```    
+
+### DNA
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'appointment_status','DNA','', '', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','appointment_status','DNA','','')
+data <- data %>%
+  filter (appointment_status == 'DNA')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+#########  GP END #########################!!!!!!!!!!!!!!!!
+```
+
+
+HCP split {data-navmenu="Appts by HCP"}
+===================================== 
+
+### HCP comparison
+
+This is taking a rolling years data to `r format(latest_mth, '%B %Y' )`, a rolling year was chosen to smooth out seasonality.
+
+This shows the split by systems of the total number of appointments carried out by HCP type.
+
+
+```{r fig.width= 20}
+prop_data_plot
+
+```
+
+HCP appts by type {data-navmenu="Appts by HCP"}
+===================================== 
+
+### HCP comparison by mode of appointment
+
+This is taking a rolling years data to `r format(latest_mth, '%B %Y' )`, a rolling year was chosen to smooth out seasonality.
+
+This shows the split by systems of the total number of appointments carried out by HCP type and by mode.
+
+```{r fig.width= 20}
+prop_data_plot_hcp
+
+```
+
+
+
+BNSSG {data-navmenu="Seasonality Forecast"}
+===================================== 
+
+The graph on the left breaks down the time series into components.  The top graph is the straight data.   The trend graph shows the overall trend.  The seasonal shows the peaks and troughs of the seasonality and the remainder, shows the excess unexpected 'noise'  This is most notable during initial covid lock down when there was unusual activity.
+
+The graph on the right shows a simple forecast model of potential future activity.
+
+Splitting the data between GP and Other practice staff highlights the greater seasonality for other practice staff in the October period.
+
+Row {.tabset}
+-------------------------------------
+    
+### Total Appointments
+
+```{r fig.width= 20}
+season_forecast_fun('','','','','','','BNSSG')
+
+```
+    
+### GP Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','GP','','','','','BNSSG')
+
+###################################################################################################
+```
+    
+### Other Practice Staff Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','Other Practice staff','','','','','BNSSG')
+
+###################################################################################################
+```
+
+BSW {data-navmenu="Seasonality Forecast"}
+===================================== 
+
+The graph on the left breaks down the time series into components.  The top graph is the straight data.   The trend graph shows the overall trend.  The seasonal shows the peaks and troughs of the seasonality and the remainder, shows the excess unexpected 'noise'  This is most notable during initial covid lock down when there was unusual activity.
+
+The graph on the right shows a simple forecast model of potential future activity.
+
+Splitting the data between GP and Other practice staff highlights the greater seasonality for other practice staff in the October period.
+
+Row {.tabset}
+-------------------------------------
+    
+### Total Appointments
+
+```{r fig.width= 20}
+season_forecast_fun('','','','','','','BSW')
+
+```
+    
+### GP Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','GP','','','','','BSW')
+
+###################################################################################################
+```
+    
+### Other Practice Staff Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','Other Practice staff','','','','','BSW')
+
+###################################################################################################
+```
+
+Cornwall {data-navmenu="Seasonality Forecast"}
+===================================== 
+
+The graph on the left breaks down the time series into components.  The top graph is the straight data.   The trend graph shows the overall trend.  The seasonal shows the peaks and troughs of the seasonality and the remainder, shows the excess unexpected 'noise'  This is most notable during initial covid lock down when there was unusual activity.
+
+The graph on the right shows a simple forecast model of potential future activity.
+
+Splitting the data between GP and Other practice staff highlights the greater seasonality for other practice staff in the October period.
+
+Row {.tabset}
+-------------------------------------
+    
+### Total Appointments
+
+```{r fig.width= 20}
+
+season_forecast_fun('','','','','','','Cornwall')
+```
+    
+### GP Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','GP','','','','','Cornwall')
+
+```
+    
+### Other Practice Staff Appointments
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','Other Practice staff','','','','','Cornwall')
+
+```
+
+
+Devon {data-navmenu="Seasonality Forecast"}
+===================================== 
+
+The graph on the left breaks down the time series into components.  The top graph is the straight data.   The trend graph shows the overall trend.  The seasonal shows the peaks and troughs of the seasonality and the remainder, shows the excess unexpected 'noise'  This is most notable during initial covid lock down when there was unusual activity.
+
+The graph on the right shows a simple forecast model of potential future activity.
+
+Splitting the data between GP and Other practice staff highlights the greater seasonality for other practice staff in the October period.
+
+Row {.tabset}
+-------------------------------------
+    
+### Total Appointments
+
+```{r fig.width= 20}
+season_forecast_fun('','','','','','','Devon')
+
+```
+    
+### GP Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','GP','','','','','Devon')
+
+###################################################################################################
+```
+    
+### Other Practice Staff Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','Other Practice staff','','','','','Devon')
+
+###################################################################################################
+```
+
+
+Dorset {data-navmenu="Seasonality Forecast"}
+===================================== 
+
+The graph on the left breaks down the time series into components.  The top graph is the straight data.   The trend graph shows the overall trend.  The seasonal shows the peaks and troughs of the seasonality and the remainder, shows the excess unexpected 'noise'  This is most notable during initial covid lock down when there was unusual activity.
+
+The graph on the right shows a simple forecast model of potential future activity.
+
+Splitting the data between GP and Other practice staff highlights the greater seasonality for other practice staff in the October period.
+
+Row {.tabset}
+-------------------------------------
+    
+### Total Appointments
+
+```{r fig.width= 20}
+season_forecast_fun('','','','','','','Dorset')
+
+```
+    
+### GP Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','GP','','','','','Dorset')
+
+###################################################################################################
+```
+    
+### Other Practice Staff Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','Other Practice staff','','','','','Dorset')
+
+###################################################################################################
+```
+
+
+
+Gloucestershire {data-navmenu="Seasonality Forecast"}
+===================================== 
+
+The graph on the left breaks down the time series into components.  The top graph is the straight data.   The trend graph shows the overall trend.  The seasonal shows the peaks and troughs of the seasonality and the remainder, shows the excess unexpected 'noise'  This is most notable during initial covid lock down when there was unusual activity.
+
+The graph on the right shows a simple forecast model of potential future activity.
+
+Splitting the data between GP and Other practice staff highlights the greater seasonality for other practice staff in the October period.
+
+Row {.tabset}
+-------------------------------------
+    
+### Total Appointments
+
+```{r fig.width= 20}
+season_forecast_fun('','','','','','','Gloucestershire')
+
+```
+    
+### GP Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','GP','','','','','Gloucestershire')
+
+###################################################################################################
+```
+    
+### Other Practice Staff Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','Other Practice staff','','','','','Gloucestershire')
+
+###################################################################################################
+```
+
+
+
+Somerset {data-navmenu="Seasonality Forecast"}
+===================================== 
+
+The graph on the left breaks down the time series into components.  The top graph is the straight data.   The trend graph shows the overall trend.  The seasonal shows the peaks and troughs of the seasonality and the remainder, shows the excess unexpected 'noise'  This is most notable during initial covid lock down when there was unusual activity.
+
+The graph on the right shows a simple forecast model of potential future activity.
+
+Splitting the data between GP and Other practice staff highlights the greater seasonality for other practice staff in the October period.
+
+Row {.tabset}
+-------------------------------------
+    
+### Total Appointments
+
+```{r fig.width= 20}
+season_forecast_fun('','','','','','','Somerset')
+
+```
+    
+### GP Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','GP','','','','','Somerset')
+
+###################################################################################################
+```
+    
+### Other Practice Staff Appointments
+
+
+```{r fig.width= 20}
+season_forecast_fun('hcp_type','Other Practice staff','','','','','Somerset')
+
+########################### end of seasonal #############################################
+#########################################################################################
+```
+
+Regional {data-navmenu="Same day appts"}
+===================================== 
+
+This is the percentage / rate of appointments recorded as occurring same day as referral.  This is calculated as a percentage of the total appointments.  This does not take into account any clinical priority, patient choice or clock stops.  
+
+Row {.tabset}
+-------------------------------------
+
+### All regions - Percentage of all appointments carried out same day  
+
+**Please not caveats on front page around timeliness** 
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('region', 'timeliness_sd', '1', '','','', '', 'perc')
+data <- dat('region','timeliness_sd','1','','','','')
+data <- data %>%
+  filter (timeliness_sd == '1')
+b <- ptd_plt (data, 'new_region_name', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### All regions - rate of appointments seen same day  
+
+**Please not caveats on front page around timeliness** 
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('region', 'timeliness_sd', '1', '','','', '', 'rate')
+data <- dat('region','timeliness_sd','1','','','','')
+data <- data %>%
+  filter (timeliness_sd == '1')
+b <- ptd_plt (data, 'new_region_name', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+  
+Systems {data-navmenu="Same day appts"}
+=====================================   
+
+This is the percentage / rate of appointments recorded as occurring same day as referral.  This is calculated as a percentage of the total appointments.  This does not take into account any clinical priority, patient choice or clock stops.  
+
+Row {.tabset}
+-------------------------------------
+    
+### All Appointments - Percentage of all appointments carried out same day
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'timeliness_sd', '1', '','','', '', 'perc')
+data <- dat('SW','timeliness_sd','1','','','','')
+data <- data %>%
+  filter (timeliness_sd == '1')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+### All Appointments - rate of appointments seen same day
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'timeliness_sd', '1', '','','', '', 'rate')
+data <- dat('SW','timeliness_sd','1','','','','')
+data <- data %>%
+  filter (timeliness_sd == '1')
+b <- ptd_plt (data, 'stp_name_short', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Face to Face - percentage
+
+Of the total number of face to face appointments, what percentage were seen same day.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'timeliness_sd', '1', 'appointment_mode','Face-to-Face','', '', 'perc')
+data <- dat('SW','timeliness_sd','1','appointment_mode','Face-to-Face','','')
+data <- data %>%
+  filter (appointment_mode == 'Face-to-Face')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Telephone
+
+Of the total number of telephone appointments, what percentage were seen same day.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'appointment_mode', 'Telephone', 'timeliness_sd','1','', '', 'perc')
+data <- dat('SW','appointment_mode','Telephone','timeliness_sd','1','','')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Home visit
+
+Of the total number of home visits appointments, what percentage were seen same day.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'appointment_mode', 'Home Visit', 'timeliness_sd','1','', '', 'perc')
+data <- dat('SW','appointment_mode','Home Visit','timeliness_sd','1','','')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+#z
+```
+
+GP Only {data-navmenu="Same day appts"}
+=====================================   
+
+This is the percentage / rate of appointments with a GP, recorded as occurring same day as referral.  This is calculated as a percentage of the total appointments.  This does not take into account any clinical priority, patient choice or clock stops. 
+
+Row {.tabset}
+-------------------------------------
+    
+### All Appointments - percentage of all GP appointments that were seen same day
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'timeliness_sd','1','', '', 'perc')
+data <- dat('SW','hcp_type','GP','timeliness_sd','1','','')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+### All Appointments - rate of all GP appointments that were seen same day
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'timeliness_sd','1','', '', 'rate')
+data <- dat('SW','hcp_type','GP','timeliness_sd','1','','')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'rate', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Face to Face
+
+Of the total GP appointments carried out face to face, this is the percentage that were seen same day.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'appointment_mode','Face-to-Face','timeliness_sd', '1', 'perc')
+data <- dat('SW','hcp_type','GP','appointment_mode','Face-to-Face','timeliness_sd', '1')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Telephone
+
+Of the total GP appointments carried out by telephone, this is the percentage that were seen same day.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'appointment_mode','Telephone','timeliness_sd', '1', 'perc')
+data <- dat('SW','hcp_type','GP','appointment_mode','Telephone','timeliness_sd', '1')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Home visit
+
+Of the total GP appointments carried out by home visit, this is the percentage that were seen same day.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'appointment_mode','Home Visit','timeliness_sd', '1', 'perc')
+data <- dat('SW','hcp_type','GP','appointment_mode','Home Visit','timeliness_sd', '1')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2) 
+
+```
+
+Other Practice Staff {data-navmenu="Same day appts"}
+=====================================   
+
+This is the percentage / rate of appointments with other practice staff, recorded as occurring same day as referral.  This is calculated as a percentage of the total appointments.  This does not take into account any clinical priority, patient choice or clock stops. 
+
+Row {.tabset}
+-------------------------------------
+    
+### All Appointments - percentage of all other practice staff appointments that were seen same day
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'timeliness_sd','1','', '', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','timeliness_sd','1','','')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+    
+### All Appointments - rate of all other practice staff appointments that were seen same day
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'timeliness_sd','1','', '', 'rate')
+data <- dat('SW','hcp_type','Other Practice staff','timeliness_sd','1','','')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Face to Face
+
+Of the total other practice appointments carried out face to face, this is the percentage that were seen same day.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'appointment_mode','Face-to-Face','timeliness_sd', '1', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','appointment_mode','Face-to-Face','timeliness_sd', '1')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Telephone
+
+Of the total other practice staff appointments carried out by telephone, this is the percentage that were seen same day.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'appointment_mode','Telephone','timeliness_sd', '1', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','appointment_mode','Telephone','timeliness_sd', '1')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Home visit
+
+Of the total Other Practice staff appointments carried out by home visit, this is the percentage that were seen same day.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'appointment_mode','Home Visit','timeliness_sd', '1', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','appointment_mode','Home Visit','timeliness_sd', '1')
+data <- data %>%
+  filter (timeliness_sd == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2) 
+
+########################  end of same day
+
+```
+
+Regional {data-navmenu="14 day appts"}
+===================================== 
+
+This is the percentage / rate of appointments with other practice staff, recorded as occurring within 14 days of referral.  This is calculated as a percentage of the total appointments.  This does not take into account any clinical priority, patient choice or clock stops.  
+
+Row {.tabset}
+-------------------------------------
+
+### All regions - Percentage of all appointments carried out within 14 days  
+
+**Please not caveats on front page around timeliness** 
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('region', 'timeliness_14', '1', '','','', '', 'perc')
+data <- dat('region','timeliness_14','1','','','','')
+data <- data %>%
+  filter (timeliness_14 == '1')
+b <- ptd_plt (data, 'new_region_name', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### All regions - rate of appointments seen within 14 days  
+
+**Please not caveats on front page around timeliness** 
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('region', 'timeliness_14', '1', '','','', '', 'rate')
+data <- dat('region','timeliness_14','1','','','','')
+data <- data %>%
+  filter (timeliness_14 == '1')
+b <- ptd_plt (data, 'new_region_name', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+  
+Systems {data-navmenu="14 day appts"}
+=====================================   
+
+This is the percentage / rate of appointments with other practice staff, recorded as occurring within 14 days of referral.  This is calculated as a percentage of the total appointments.  This does not take into account any clinical priority, patient choice or clock stops.  
+
+Row {.tabset}
+-------------------------------------
+    
+### All Appointments - Percentage of all appointments carried out within 14 days
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'timeliness_14', '1', '','','', '', 'perc')
+data <- dat('SW','timeliness_14','1','','','','')
+data <- data %>%
+  filter (timeliness_14 == '1')
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+### All Appointments - rate of appointments seen within 14 days
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'timeliness_14', '1', '','','', '', 'rate')
+data <- dat('SW','timeliness_14','1','','','','')
+data <- data %>%
+  filter (timeliness_14 == '1')
+b <- ptd_plt (data, 'stp_name_short', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Face to Face - percentage
+
+Of the total number of face to face appointments, what percentage were seen within 14 days.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'timeliness_14', '1', 'appointment_mode','Face-to-Face','', '', 'perc')
+data <- dat('SW','timeliness_14','1','appointment_mode','Face-to-Face','','')
+data <- data %>%
+  filter (appointment_mode == 'Face-to-Face')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Telephone
+
+Of the total number of telephone appointments, what percentage were seen within 14 days.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'appointment_mode', 'Telephone', 'timeliness_14','1','', '', 'perc')
+data <- dat('SW','appointment_mode','Telephone','timeliness_14','1','','')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Home visit
+
+Of the total number of home visits appointments, what percentage were seen within 14 days.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'appointment_mode', 'Home Visit', 'timeliness_14','1','', '', 'perc')
+data <- dat('SW','appointment_mode','Home Visit','timeliness_14','1','','')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+#z
+```
+
+GP Only {data-navmenu="14 day appts"}
+=====================================   
+
+This is the percentage / rate of appointments recorded as occurring within 14 days of referral.  This is calculated as a percentage of the total appointments.  This does not take into account any clinical priority, patient choice or clock stops.  
+
+Row {.tabset}
+-------------------------------------
+    
+### All Appointments - percentage of all GP appointments that were seen within 14 days
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'timeliness_14','1','', '', 'perc')
+data <- dat('SW','hcp_type','GP','timeliness_14','1','','')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### All Appointments - rate of all GP appointments that were seen within 14 days
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'timeliness_sd','1','', '', 'rate')
+data <- dat('SW','hcp_type','GP','timeliness_14','1','','')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'rate', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Face to Face
+
+Of the total GP appointments carried out face to face, this is the percentage that were seen within 14 days.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'appointment_mode','Face-to-Face','timeliness_14', '1', 'perc')
+data <- dat('SW','hcp_type','GP','appointment_mode','Face-to-Face','timeliness_14', '1')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Telephone
+
+Of the total GP appointments carried out by telephone, this is the percentage that were seen within 14 days.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'appointment_mode','Telephone','timeliness_14', '1', 'perc')
+data <- dat('SW','hcp_type','GP','appointment_mode','Telephone','timeliness_14', '1')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Home visit
+
+Of the total GP appointments carried out by home visit, this is the percentage that were seen within 14 days.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'GP', 'appointment_mode','Home Visit','timeliness_14', '1', 'perc')
+data <- dat('SW','hcp_type','GP','appointment_mode','Home Visit','timeliness_14', '1')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2) 
+
+```
+
+Other Practice Staff {data-navmenu="14 day appts"}
+=====================================   
+
+This is the percentage / rate of appointments with other practice staff, recorded as occurring within 14 days of referral.  This is calculated as a percentage of the total appointments.  This does not take into account any clinical priority, patient choice or clock stops.  
+
+Row {.tabset}
+-------------------------------------
+    
+### All Appointments - percentage of all other practice staff appointments that were seen within 14 days
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'timeliness_14','1','', '', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','timeliness_14','1','','')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+    
+### All Appointments - rate of all other practice staff appointments that were seen within 14 days
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'timeliness_14','1','', '', 'rate')
+data <- dat('SW','hcp_type','Other Practice staff','timeliness_14','1','','')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'rate', FALSE, 'Rate of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Face to Face
+
+Of the total other practice appointments carried out face to face, this is the percentage that were seen within 14 days.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'appointment_mode','Face-to-Face','timeliness_14', '1', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','appointment_mode','Face-to-Face','timeliness_14', '1')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Telephone
+
+Of the total other practice staff appointments carried out by telephone, this is the percentage that were seen within 14 days.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'appointment_mode','Telephone','timeliness_14', '1', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','appointment_mode','Telephone','timeliness_14', '1')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2)
+
+```
+
+### Home visit
+
+Of the total Other Practice staff appointments carried out by home visit, this is the percentage that were seen within 14 days.
+
+```{r fig.width= 20}
+a <- ribbon_plot_fun  ('SW', 'hcp_type', 'Other Practice staff', 'appointment_mode','Home Visit','timeliness_14', '1', 'perc')
+data <- dat('SW','hcp_type','Other Practice staff','appointment_mode','Home Visit','timeliness_14', '1')
+data <- data %>%
+  filter (timeliness_14 == '1')
+
+b <- ptd_plt (data, 'stp_name_short', 'perc', FALSE, 'Percentage of Appointments', NULL) 
+
+grid.arrange(a, b, ncol = 2) 
+
+########################  end of 14 day
+
+```
+
+
+HCP type {data-navmenu="Table data"}
+===================================== 
+
+This table shows total appointments over last 12 months.  Gives proportion of appointments by hcp type, mode and timeliness.
+
+Please note the timeliness breakdown shows the percentage within that time group and is not cumulative. 
+
+You can click on the small arrows on the side of the data to expand the data set.
+
+Column
+-------------------------------------
+    
+### 
+
+```{r fig.width= 20}
+prop_table
+
+```
+
+Timeliness {data-navmenu="Table data"}
+===================================== 
+
+This table shows total appointments over last 12 months.  Gives proportion of appointments by timeliness, hcp type and mode.
+
+Please note the timeliness breakdown shows the percentage within that time group and is not cumulative. 
+
+You can click on the small arrows on the side of the data to expand the data set.
+
+```{r}
+prop_table_time
+
+```
+ 
